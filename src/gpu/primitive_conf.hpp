@@ -501,7 +501,7 @@ struct bnorm_conf_t {
     data_type_t data_type;
 
     int ndims;
-    int mb, ic, mb_block, ic_block;
+    int mb, ic, mb_block, ic_block, ic_padded;
     int reduce_dim_idx, reduce_dim;
     int id, ih, iw;
     int nn, sp, sp_tail, vect_size;

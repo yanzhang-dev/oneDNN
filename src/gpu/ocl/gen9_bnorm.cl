@@ -90,7 +90,7 @@ void gen9_reduce_common(__global float *reduce_temp, __local float *local_sum,
 
     if (ic_sub_group > 0) { local_sum[ic_sub_group * 16 + simd_id] = sum; }
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (ic_sub_group == 0) {
+    if (ic_sub_group == 0 && c < IC) {
         for (int i = 1; i < REDUCE_IC_SUB_GROUPS; i++) {
             sum += local_sum[i * 16 + simd_id];
         }
@@ -112,7 +112,7 @@ __kernel void gen9_calc_mean(
     src += c + sp_block_idx * STAT_SP_BLOCK * IC;
 #else
     src += (c & 15) + sp_block_idx * STAT_SP_BLOCK * 16 + (c & ~15) * SP
-            + mb * SP * IC;
+            + mb * SP * IC_PADDED;
 #endif
 
     float8 res0 = 0.0f, res1 = 0.0f;
@@ -188,19 +188,28 @@ __kernel void gen9_calc_variance(__global DATA_T *src, __global float *mean,
     const int mb_sp_idx = mb * STAT_SP_NBLOCKS + sp_block_idx;
     const int group_c_offset = REDUCE_STAT_NBLOCKS * 16 * (int)(c / 16);
     const int simd_id = get_sub_group_local_id();
-    reduce_temp += REDUCE_STAT_NBLOCKS * IC;
+    const bool out_of_range = (c + simd_id) >= IC ? true : false;
+    const bool tail_channel = (c + get_sub_group_size()) > IC ? true : false;
+
+    reduce_temp += REDUCE_STAT_NBLOCKS * IC_PADDED;
 
 #if USE_NHWC
     src += c + sp_block_idx * STAT_SP_BLOCK * IC;
 #else
     src += (c & 15) + sp_block_idx * STAT_SP_BLOCK * 16 + (c & ~15) * SP
-            + mb * SP * IC;
+            + mb * SP * IC_PADDED;
 #endif
 
     float8 res0 = 0.0f, res1 = 0.0f;
     float v_var = 0.0f;
 
-    float v_mean = LOAD_FLOAT_1x16(&mean[c]);
+    float v_mean = 0.0f;
+
+    if (!tail_channel) {
+        v_mean = LOAD_FLOAT_1x16(&mean[c]);
+    } else if (!out_of_range) {
+        v_mean = mean[c + simd_id];
+    }
 
 #if HAS_STAT_SP_TAIL
     if (sp_block_idx == STAT_SP_TAIL) {
@@ -209,9 +218,9 @@ __kernel void gen9_calc_variance(__global DATA_T *src, __global float *mean,
 #if USE_NHWC
             float8 s0, s1;
             for (int k = 0; k < 8; ++k)
-                s0[k] = LOAD_DATA_1x16(&src[k * IC]);
+                s0[k] = LOAD_DATA_1x16(&src[k * IC_PADDED]);
             for (int k = 0; k < 8; ++k)
-                s1[k] = LOAD_DATA_1x16(&src[(k + 8) * IC]);
+                s1[k] = LOAD_DATA_1x16(&src[(k + 8) * IC_PADDED]);
 #else
             float8 s0 = LOAD_DATA_8x16(&src[0]);
             float8 s1 = LOAD_DATA_8x16(&src[8 * 16]);
@@ -239,9 +248,9 @@ __kernel void gen9_calc_variance(__global DATA_T *src, __global float *mean,
 #if USE_NHWC
             float8 s0, s1;
             for (int k = 0; k < 8; ++k)
-                s0[k] = LOAD_DATA_1x16(&src[k * IC]);
+                s0[k] = LOAD_DATA_1x16(&src[k * IC_PADDED]);
             for (int k = 0; k < 8; ++k)
-                s1[k] = LOAD_DATA_1x16(&src[(k + 8) * IC]);
+                s1[k] = LOAD_DATA_1x16(&src[(k + 8) * IC_PADDED]);
 #else
             float8 s0 = LOAD_DATA_8x16(&src[0]);
             float8 s1 = LOAD_DATA_8x16(&src[8 * 16]);
@@ -258,6 +267,7 @@ __kernel void gen9_calc_variance(__global DATA_T *src, __global float *mean,
     for (int i = 0; i < 8; i++) {
         v_var += res0[i] + res1[i];
     }
+
     STORE_FLOAT_1x16(
             &reduce_temp[group_c_offset + mb_sp_idx * 16 + simd_id], v_var);
 }
@@ -267,10 +277,9 @@ __kernel void gen9_reduce_variance(
         __global float *reduce_temp, __global float *variance) {
     __local float local_sum[16 * REDUCE_IC_SUB_GROUPS];
     gen9_reduce_common(
-            reduce_temp + REDUCE_STAT_NBLOCKS * IC, local_sum, variance);
+            reduce_temp + REDUCE_STAT_NBLOCKS * IC_PADDED, local_sum, variance);
 }
 
-KERNEL_ATTR
 __kernel void gen9_bnorm_fwd(__global DATA_T *src, __global float *mean,
         __global float *variance, __global DATA_T *dst,
         __global float *scaleshift, __global float *shift, __global char *ws,
@@ -278,11 +287,14 @@ __kernel void gen9_bnorm_fwd(__global DATA_T *src, __global float *mean,
     const int n = GWS_GET_MB();
     const int c = GWS_GET_IC();
     const int sp = GWS_GET_SP() * VECT_SIZE;
+    const int simd_id = get_sub_group_local_id();
+    const bool out_of_range = (c + simd_id) >= IC ? true : false;
+    const bool tail_channel = (c + get_sub_group_size()) > IC ? true : false;
 
 #if USE_NHWC
     const uint d_off = sp * IC + c;
 #else
-    const uint d_off = (c & 15) + sp * 16 + (c & ~15) * SP + n * SP * IC;
+    const uint d_off = (c & 15) + sp * 16 + (c & ~15) * SP + n * SP * IC_PADDED;
 #endif
     src += d_off;
     dst += d_off;
@@ -297,30 +309,55 @@ __kernel void gen9_bnorm_fwd(__global DATA_T *src, __global float *mean,
     {
 #if USE_NHWC
         for (int k = 0; k < 8; ++k)
-            blockS0[k] = LOAD_DATA_1x16(&src[k * IC]);
+            blockS0[k] = LOAD_DATA_1x16(&src[k * IC_PADDED]);
 #else
         blockS0 = LOAD_DATA_8x16(&src[0]);
 #endif
     }
 
+    float sm = 0.0f;
+    float sv = 0.0f;
+    float v_mean = 0.0f;
+    float v_variance = 0.0f;
+
+    if (!tail_channel) {
 #if USE_SCALESHIFT == 1
-    float sm = LOAD_FLOAT_1x16(&scaleshift[c]);
-    float sv = LOAD_FLOAT_1x16(&scaleshift[IC + c]);
+        sm = LOAD_FLOAT_1x16(&scaleshift[c]);
+        sv = LOAD_FLOAT_1x16(&scaleshift[IC + c]);
 #else
 #if USE_SCALE == 1
-    float sm = LOAD_FLOAT_1x16(&scaleshift[c]);
+        sm = LOAD_FLOAT_1x16(&scaleshift[c]);
 #else
-    float sm = 1.0f;
+        sm = 1.0f;
 #endif
 #if USE_SHIFT == 1
-    float sv = LOAD_FLOAT_1x16(&shift[c]);
+        sv = LOAD_FLOAT_1x16(&shift[c]);
 #else
-    float sv = 0.0f;
+        sv = 0.0f;
 #endif
 #endif
+        v_mean = LOAD_FLOAT_1x16(&mean[c]);
+        v_variance = LOAD_FLOAT_1x16(&variance[c]);
 
-    float v_mean = LOAD_FLOAT_1x16(&mean[c]);
-    float v_variance = LOAD_FLOAT_1x16(&variance[c]);
+    } else if (!out_of_range) {
+#if USE_SCALESHIFT == 1
+        sm = scaleshift[c + simd_id];
+        sv = scaleshift[IC + c + simd_id];
+#else
+#if USE_SCALE == 1
+        sm = scaleshift[c + simd_id];
+#else
+        sm = 1.0f;
+#endif
+#if USE_SHIFT == 1
+        sv = shift[c + simd_id];
+#else
+        sv = 0.0f;
+#endif
+#endif
+        v_mean = mean[c + simd_id];
+        v_variance = variance[c + simd_id];
+    }
 
     float sqrt_variance = sm / sqrt(v_variance + eps);
 
@@ -359,6 +396,7 @@ __kernel void gen9_bnorm_fwd(__global DATA_T *src, __global float *mean,
     if (sp == SP_TAIL) {
         for (int k = 0; k < SP - SP_TAIL; ++k) {
             STORE_DATA_1x16(&dst[k * IC_BLOCK_STRIDE], blockD0[k]);
+            printf("%d, %d, %f\n", d_off, k, blockD0[k]);
         }
     } else
 #endif // HAS_SP_TAIL
@@ -434,19 +472,25 @@ __kernel void gen9_calculate_stats(__global DATA_T *src, __global float *mean,
     const int mb_sp_idx = mb * STAT_SP_NBLOCKS + sp_block_idx;
     const int group_c_offset = REDUCE_STAT_NBLOCKS * 16 * (int)(c / 16);
     const int simd_id = get_sub_group_local_id();
+    const bool out_of_range = (c + simd_id) >= IC ? true : false;
     diff_scaleshift += group_c_offset;
 
 #if USE_NHWC
-    const int offset = c + sp_block_idx * STAT_SP_BLOCK * IC;
+    const int offset = c + sp_block_idx * STAT_SP_BLOCK * IC_PADDED;
 #else
     const int offset = (c & 15) + sp_block_idx * STAT_SP_BLOCK * 16
-            + (c & ~15) * SP + mb * SP * IC;
+            + (c & ~15) * SP + mb * SP * IC_PADDED;
 #endif
     src += offset;
     diff_dst += offset;
     ws += offset;
 
-    float v_mean = LOAD_FLOAT_1x16(&mean[c]);
+    float v_mean = 0.0f;
+    if (c + get_sub_group_size() <= IC) {
+        v_mean = LOAD_FLOAT_1x16(&mean[c]);
+    } else if ((c + simd_id) < IC) {
+        v_mean = mean[c + simd_id];
+    }
 
     float8 diff_gamma = 0.0f;
     float8 diff_beta = 0.0f;
@@ -528,8 +572,8 @@ __kernel void gen9_calculate_stats(__global DATA_T *src, __global float *mean,
     }
 
     STORE_FLOAT_1x16(&diff_scaleshift[mb_sp_idx * 16 + simd_id], diff_gamma[0]);
-    STORE_FLOAT_1x16(&diff_scaleshift[REDUCE_STAT_NBLOCKS * IC + mb_sp_idx * 16
-                             + simd_id],
+    STORE_FLOAT_1x16(&diff_scaleshift[REDUCE_STAT_NBLOCKS * IC_PADDED
+                             + mb_sp_idx * 16 + simd_id],
             diff_beta[0]);
 }
 
@@ -552,7 +596,7 @@ __kernel void gen9_reduce_stats(__global float *reduce_temp,
     for (int i = 0; i < REDUCE_STAT_NBLOCKS / REDUCE_IC_SUB_GROUPS; i++) {
         diff_gamma += reduce_temp[i * 16];
     }
-    reduce_temp += IC * REDUCE_STAT_NBLOCKS;
+    reduce_temp += IC_PADDED * REDUCE_STAT_NBLOCKS;
     for (int i = 0; i < REDUCE_STAT_NBLOCKS / REDUCE_IC_SUB_GROUPS; i++) {
         diff_beta += reduce_temp[i * 16];
     }
@@ -562,7 +606,7 @@ __kernel void gen9_reduce_stats(__global float *reduce_temp,
         local_beta[ic_sub_group * 16 + simd_id] = diff_beta;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (ic_sub_group == 0) {
+    if (ic_sub_group == 0 && c < IC) {
         for (int i = 1; i < REDUCE_IC_SUB_GROUPS; i++) {
             diff_gamma += local_gamma[i * 16 + simd_id];
             diff_beta += local_beta[i * 16 + simd_id];
@@ -576,39 +620,69 @@ __kernel void gen9_reduce_stats(__global float *reduce_temp,
 #elif DIFF_SCALE == 1 || DIFF_SHIFT == 1
         diff_shift[c] = diff_beta;
 #else
-        diff_scaleshift[IC * REDUCE_STAT_NBLOCKS + c] = diff_beta;
+        diff_scaleshift[IC_PADDED * REDUCE_STAT_NBLOCKS + c] = diff_beta;
 #endif // #if DIFF_SCALESHIFT == 1
     }
 }
 
-KERNEL_ATTR
 __kernel void gen9_bnorm_bwd(__global DATA_T *src, __global float *mean,
         __global float *variance, __global DATA_T *diff_dst,
         __global float *scaleshift, __global char *ws,
         __global DATA_T *diff_src, __global float *diff_scaleshift,
         __global float *diff_shift, float eps) {
     const int c = GWS_GET_IC();
+    const int simd_id = get_sub_group_local_id();
+    bool out_of_range = (c + simd_id) >= IC ? true : false;
+    const bool tail_channel = (c + get_sub_group_size()) > IC ? true : false;
 
-    const float v_variance = LOAD_FLOAT_1x16(&variance[c]);
+    float v_variance = 1.0f;
+    float v_mean = 0.0f;
+    float diff_gamma = 0.0f;
+    float diff_beta = 0.0f;
+    float gamma = 0.0f;
+
+    if (!tail_channel) {
+        v_variance = LOAD_FLOAT_1x16(&variance[c]);
 
 #if CALCULATE_DIFF_STATS == 1
-    const float v_mean = LOAD_FLOAT_1x16(&mean[c]);
-    const float diff_gamma = LOAD_FLOAT_1x16(&diff_scaleshift[c]);
+        v_mean = LOAD_FLOAT_1x16(&mean[c]);
+        diff_gamma = LOAD_FLOAT_1x16(&diff_scaleshift[c]);
 #if DIFF_SCALESHIFT == 1
-    const float diff_beta = LOAD_FLOAT_1x16(&diff_scaleshift[IC + c]);
+        diff_beta = LOAD_FLOAT_1x16(&diff_scaleshift[IC + c]);
 #elif DIFF_SCALE == 1 || DIFF_SHIFT == 1
-    const float diff_beta = LOAD_FLOAT_1x16(&diff_shift[c]);
+        diff_beta = LOAD_FLOAT_1x16(&diff_shift[c]);
 #else
-    const float diff_beta
-            = LOAD_FLOAT_1x16(&diff_scaleshift[REDUCE_STAT_NBLOCKS * IC + c]);
+        diff_beta = LOAD_FLOAT_1x16(
+                &diff_scaleshift[REDUCE_STAT_NBLOCKS * IC_PADDED + c]);
 #endif // #if DIFF_SCALESHIFT == 1
 #endif // #if CALCULATE_DIFF_STATS == 1
 
 #if USE_SCALESHIFT == 1 || USE_SCALE == 1
-    const float gamma = LOAD_FLOAT_1x16(&scaleshift[c]);
+        gamma = LOAD_FLOAT_1x16(&scaleshift[c]);
 #else
-    const float gamma = 1;
+        gamma = 1;
 #endif // #if USE_SCALESHIFT == 1 || USE_SCALE == 1
+    } else if (!out_of_range) {
+        v_variance = variance[c + simd_id];
+#if CALCULATE_DIFF_STATS == 1
+        v_mean = mean[c + simd_id];
+        diff_gamma = diff_scaleshift[c + simd_id];
+#if DIFF_SCALESHIFT == 1
+        diff_beta = diff_scaleshift[IC + c + simd_id];
+#elif DIFF_SCALE == 1 || DIFF_SHIFT == 1
+        diff_beta = diff_shift[c + simd_id];
+#else
+        diff_beta = diff_scaleshift[REDUCE_STAT_NBLOCKS * IC_PADDED + c
+                + simd_id];
+#endif // #if DIFF_SCALESHIFT == 1
+#endif // #if CALCULATE_DIFF_STATS == 1
+
+#if USE_SCALESHIFT == 1 || USE_SCALE == 1
+        gamma = scaleshift[c + simd_id];
+#else
+        gamma = 1;
+#endif // #if USE_SCALESHIFT == 1 || USE_SCALE == 1
+    }
 
     const int sp_block_idx = GWS_GET_SP();
 #if USE_NHWC
@@ -616,7 +690,7 @@ __kernel void gen9_bnorm_bwd(__global DATA_T *src, __global float *mean,
 #else
     const int mb = GWS_GET_MB();
     const int offset = (c & 15) + sp_block_idx * VECT_SIZE * 16 + (c & ~15) * SP
-            + mb * SP * IC;
+            + mb * SP * IC_PADDED;
 #endif
     src += offset;
     diff_dst += offset;

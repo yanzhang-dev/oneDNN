@@ -94,8 +94,8 @@ static status_t init_conf_common(bnorm_conf_t &conf, offsets_t &off,
 
     conf.mb_block = 1;
     conf.ic_block = 16;
+    conf.ic_padded = utils::rnd_up(conf.ic, conf.ic_block);
 
-    const bool has_padding = !data_mdw.is_dense();
     const bool is_blocked_16c
             = data_mdw.matches_one_of_tag(nCw16c, nChw16c, nCdhw16c);
     const bool is_blocked_16n16c
@@ -107,9 +107,7 @@ static status_t init_conf_common(bnorm_conf_t &conf, offsets_t &off,
 
     conf.use_nhwc = is_nhwc;
 
-    if (has_padding
-            || !(is_blocked_16c || is_blocked_16n16c || is_blocked_32n16c
-                    || is_nhwc))
+    if (!(is_blocked_16c || is_blocked_16n16c || is_blocked_32n16c || is_nhwc))
         return status::unimplemented;
 
     conf.mb_block = is_blocked_32n16c ? 32 : is_blocked_16n16c ? 16 : 1;
@@ -144,7 +142,7 @@ static status_t init_conf_common(bnorm_conf_t &conf, offsets_t &off,
     conf.dispatch_calc_stat = compute_engine->create_dispatch();
     conf.dispatch_calc_stat.define_dim("STAT_MB", 0, conf.nn);
     conf.dispatch_calc_stat.define_dim("STAT_SP", 1, conf.stat_sp_nblocks);
-    conf.dispatch_calc_stat.define_dim("STAT_IC", 2, conf.ic);
+    conf.dispatch_calc_stat.define_dim("STAT_IC", 2, conf.ic_padded);
     CHECK(conf.dispatch_calc_stat.vectorize_dim("STAT_IC", 16));
     conf.dispatch_calc_stat.set_kernel_attr_suffix("CALC");
     conf.dispatch_calc_stat.generate();
@@ -157,7 +155,8 @@ static status_t init_conf_common(bnorm_conf_t &conf, offsets_t &off,
     }
     conf.stat_ic = reduce_sub_group_count * 16;
     conf.dispatch_reduce_stat.define_dim("REDUCE_STAT_IC", 0, conf.stat_ic);
-    conf.dispatch_reduce_stat.define_dim("REDUCE_IC_GROUP", 1, conf.ic / 16);
+    conf.dispatch_reduce_stat.define_dim(
+            "REDUCE_IC_GROUP", 1, conf.ic_padded / 16);
     CHECK(conf.dispatch_reduce_stat.vectorize_dim("REDUCE_STAT_IC", 16));
     conf.dispatch_reduce_stat.set_kernel_attr_suffix("REDUCE");
     conf.dispatch_reduce_stat.generate();
@@ -178,7 +177,7 @@ static status_t init_conf_common(bnorm_conf_t &conf, offsets_t &off,
     conf.dispatch = compute_engine->create_dispatch(data_mdw.md_);
     conf.dispatch.define_dim("MB", 0, conf.nn);
     conf.dispatch.define_dim("SP", 1, sp_pad / conf.vect_size);
-    conf.dispatch.define_dim("IC", 2, conf.ic);
+    conf.dispatch.define_dim("IC", 2, conf.ic_padded);
     CHECK(conf.dispatch.vectorize_dim("IC", 16));
     conf.dispatch.generate();
 
@@ -197,6 +196,7 @@ static status_t init_kernel_ctx_common(compute::kernel_ctx_t &kernel_ctx,
     kernel_ctx.define_int("IW", conf.iw);
     kernel_ctx.define_int("MB_BLOCK", conf.mb_block);
     kernel_ctx.define_int("IC_BLOCK", conf.ic_block);
+    kernel_ctx.define_int("IC_PADDED", conf.ic_padded);
 
     kernel_ctx.define_int("USE_NHWC", conf.use_nhwc);
     kernel_ctx.define_int("SP", conf.sp);
@@ -251,7 +251,7 @@ status_t gen9_batch_normalization_fwd_t::pd_t::init_kernel_ctx(
 
 void gen9_batch_normalization_fwd_t::pd_t::init_scratchpad() {
     if (conf.calculate_stats) {
-        size_t size = 2 * conf.reduce_stat_nblocks * conf.ic;
+        size_t size = 2 * conf.reduce_stat_nblocks * conf.ic_padded;
 
         auto scratchpad = scratchpad_registry().registrar();
         scratchpad.book(key_bnorm_reduction, size,
@@ -382,7 +382,7 @@ status_t gen9_batch_normalization_bwd_t::pd_t::init_kernel_ctx(
 }
 
 void gen9_batch_normalization_bwd_t::pd_t::init_scratchpad() {
-    size_t size = 2 * conf.reduce_stat_nblocks * conf.ic;
+    size_t size = 2 * conf.reduce_stat_nblocks * conf.ic_padded;
 
     auto scratchpad = scratchpad_registry().registrar();
     scratchpad.book(key_bnorm_reduction, size,
